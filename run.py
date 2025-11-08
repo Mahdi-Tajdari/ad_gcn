@@ -5,19 +5,27 @@ import random
 import os
 import dgl
 import argparse
-
+import copy
 from tqdm import tqdm
-
 import torch.nn.functional as F
 
+# === ۱. ایمپورت توابع تقویت دینامیک از AD-GCL ===
+from aug import get_sim, neighbor_pruning, neighbor_completion 
+
+# برای مدیریت NumPy و PyTorch
+import numpy as np
+import scipy.sparse as sp
+import torch
+import torch.nn as nn 
+# ================================================
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ['OMP_NUM_THREADS'] = '1'
 
-parser = argparse.ArgumentParser(description='GRADATE')
+parser = argparse.ArgumentParser(description='GRADATE_ADGCL')
 parser.add_argument('--expid', type=int, default=1)
 parser.add_argument('--device', type=str, default='cuda:0')
-parser.add_argument('--dataset', type=str, default='eat')
+parser.add_argument('--dataset', type=str, default='cora')
 parser.add_argument('--lr', type=float, default=1e-3)
 parser.add_argument('--weight_decay', type=float, default=0.0)
 parser.add_argument('--runs', type=int, default=1)
@@ -32,6 +40,16 @@ parser.add_argument('--negsamp_ratio_patch', type=int, default=6)
 parser.add_argument('--negsamp_ratio_context', type=int, default=1)
 parser.add_argument('--alpha', type=float, default=0.1, help='how much the first view involves')
 parser.add_argument('--beta', type=float, default=0.1, help='how much the second view involves')
+
+# === پارامترهای جدید AD-GCL ===
+parser.add_argument('--W', type=int, default=5, help='Window size for ano_sim update')
+parser.add_argument('--degree_threshold', type=int, default=8, help='Degree threshold for low-degree nodes')
+parser.add_argument('--edge_mask_rate_1', type=float, default=0.1, help='Edge mask rate for view 1')
+parser.add_argument('--edge_mask_rate_2', type=float, default=0.1, help='Edge mask rate for view 2')
+parser.add_argument('--feat_drop_rate_1', type=float, default=0.1, help='Feature drop rate for view 1')
+parser.add_argument('--feat_drop_rate_2', type=float, default=0.1, help='Feature drop rate for view 2')
+# ==============================
+
 args = parser.parse_args()
 
 if __name__ == '__main__':
@@ -45,33 +63,47 @@ if __name__ == '__main__':
 
         seed = run + 1
         random.seed(seed)
-
-
+        
         batch_size = args.batch_size
         subgraph_size = args.subgraph_size
 
         adj, features, labels, idx_train, idx_val,\
         idx_test, ano_label, str_ano_label, attr_ano_label = load_mat(args.dataset)
 
-
-
         features, _ = preprocess_features(features)
+        
         dgl_graph = adj_to_dgl_graph(adj)
 
         nb_nodes = features.shape[0]
         ft_size = features.shape[1]
         nb_classes = labels.shape[1]
 
-        # graph data argumentation
-        adj_edge_modification = aug_random_edge(adj, 0.2)
-        adj = normalize_adj(adj)
-        adj = (adj + sp.eye(adj.shape[0])).todense()
-        adj_hat = normalize_adj(adj_edge_modification)
-        adj_hat = (adj_hat + sp.eye(adj_hat.shape[0])).todense()
+        # === ۲. حذف منطق تقویت ساختار ثابت GRADATE اصلی ===
+        # adj_edge_modification = aug_random_edge(adj, 0.2)
+        # adj = normalize_adj(adj)
+        # adj = (adj + sp.eye(adj.shape[0])).todense()
+        # adj_hat = normalize_adj(adj_edge_modification)
+        # adj_hat = (adj_hat + sp.eye(adj_hat.shape[0])).todense()
+        # =======================================================
+        
+        # === ۳. مقداردهی اولیه متغیرهای دینامیک AD-GCL ===
+        adj_numpy = adj.todense()
+        # degree: برای استفاده در pruning/completion
+        degree = np.sum(adj_numpy, axis=1).flatten() 
+        # node_dist: نمایش مجاورت (یا ماتریس گره به گره)
+        node_dist = torch.FloatTensor(adj_numpy).to(device)
+        
+        # loss_matrix_list: برای ذخیره زیان گره در طول W دوره
+        loss_matrix = np.zeros(nb_nodes)
+        loss_matrix_list = []
+        # ano_sim و sim: ماتریس‌های شباهت گره و ناهنجاری اولیه (همه یکسان)
+        # توجه: اینها در طول آموزش به صورت دینامیک به روز می‌شوند.
+        ano_sim = torch.ones(nb_nodes, nb_nodes).to(device)
+        sim = torch.ones(nb_nodes, nb_nodes).to(device)
+        # =======================================================
 
-        features = torch.FloatTensor(features[np.newaxis]).to(device)
-        adj = torch.FloatTensor(adj[np.newaxis]).to(device)
-        adj_hat = torch.FloatTensor(adj_hat[np.newaxis]).to(device)
+        # ویژگی‌ها را بدون بُعد اضافی به GPU می‌بریم (در داخل batch_idx به [np.newaxis] تبدیل می‌شود)
+        features = torch.FloatTensor(features).to(device) 
         labels = torch.FloatTensor(labels[np.newaxis]).to(device)
         idx_train = torch.LongTensor(idx_train).to(device)
         idx_val = torch.LongTensor(idx_val).to(device)
@@ -106,11 +138,42 @@ if __name__ == '__main__':
 
             model.train()
 
+            # === A. به‌روزرسانی ano_sim (منطق AD-GCL) ===
+            if epoch > 0 and (epoch % args.W == 0):
+                if len(loss_matrix_list) > 0:
+                    mean_loss_matrix = np.mean(loss_matrix_list, axis=0)
+                    loss_matrix_list = [] # ریست کردن
+                    
+                    # محاسبه ano_sim
+                    ano_sim_cpu = np.exp(mean_loss_matrix[:, np.newaxis] - mean_loss_matrix)
+                    ano_sim = torch.FloatTensor(ano_sim_cpu).to(device)
+                    
+            # === B. تولید نماهای ساختاری دینامیک A1 و A2 در هر Epoch ===
+            # View 1: هرس (Pruning) - برای GRADATE (adj)
+            # توجه: توابع AD-GCL ویژگی‌های ویژگی (feat1, feat2) را نیز دراپ می‌کنند اما در GRADATE فقط از adj استفاده می‌کنیم.
+            # ما فقط adj_view1_full را استخراج می‌کنیم.
+            _, _, _, adj_view1_full = neighbor_pruning(
+                dgl_graph, node_dist.cpu(), sim.cpu(), features.cpu(), 
+                degree, args.feat_drop_rate_1, args.feat_drop_rate_1, args.degree_threshold
+            )
+            adj_view1_full = adj_view1_full.to(device)
+            
+            # View 2: تکمیل (Completion) - برای GRADATE (adj_hat)
+            _, _, _, _, adj_view2_full, _ = neighbor_completion(
+                dgl_graph, node_dist.cpu(), sim.cpu(), ano_sim.cpu(), features.cpu(), 
+                degree, args.feat_drop_rate_1, args.edge_mask_rate_1, 
+                args.feat_drop_rate_2, args.edge_mask_rate_2, args.degree_threshold, device
+            )
+            adj_view2_full = adj_view2_full.to(device)
+            # ============================================================
+
+
             all_idx = list(range(nb_nodes))
             random.shuffle(all_idx)
             total_loss = 0.
 
             subgraphs = generate_rwr_subgraph(dgl_graph, subgraph_size)
+            current_loss_matrix = np.zeros(nb_nodes) # ماتریس زیان موقت برای دوره جاری
 
             for batch_idx in range(batch_num):
 
@@ -130,8 +193,8 @@ if __name__ == '__main__':
                 lbl_context = torch.unsqueeze(torch.cat(
                     (torch.ones(cur_batch_size), torch.zeros(cur_batch_size * args.negsamp_ratio_context))), 1).to(device)
 
-                ba = []
-                ba_hat = []
+                ba = [] # نمای A1 (هرس)
+                ba_hat = [] # نمای A2 (تکمیل)
                 bf = []
                 added_adj_zero_row = torch.zeros((cur_batch_size, 1, subgraph_size)).to(device)
                 added_adj_zero_col = torch.zeros((cur_batch_size, subgraph_size + 1, 1)).to(device)
@@ -139,9 +202,14 @@ if __name__ == '__main__':
                 added_feat_zero_row = torch.zeros((cur_batch_size, 1, ft_size)).to(device)
 
                 for i in idx:
-                    cur_adj = adj[:, subgraphs[i], :][:, :, subgraphs[i]]
-                    cur_adj_hat = adj_hat[:, subgraphs[i], :][:, :, subgraphs[i]]
-                    cur_feat = features[:, subgraphs[i], :]
+                    # === C. استخراج زیرگراف از نماهای دینامیک ===
+                    # نمای A1 (هرس)
+                    cur_adj = adj_view1_full[:, subgraphs[i], :][:, :, subgraphs[i]] 
+                    # نمای A2 (تکمیل)
+                    cur_adj_hat = adj_view2_full[:, subgraphs[i], :][:, :, subgraphs[i]]
+                    # ویژگی‌ها
+                    cur_feat = features[np.newaxis, subgraphs[i], :]
+                    
                     ba.append(cur_adj)
                     ba_hat.append(cur_adj_hat)
                     bf.append(cur_feat)
@@ -158,7 +226,11 @@ if __name__ == '__main__':
                 logits_1, logits_2, subgraph_embed, node_embed = model(bf, ba)
                 logits_1_hat, logits_2_hat,  subgraph_embed_hat, node_embed_hat = model(bf, ba_hat)
 
-                #subgraph-subgraph contrast loss
+                # === D. به‌روزرسانی sim و ذخیره امتیاز ناهنجاری ===
+                # محاسبه sim (شباهت گره‌ای) برای استفاده در دوره بعدی
+                # sim = get_sim(node_embed[:, -1, :], node_embed[:, -1, :]) # node_embed شامل گره‌های مثبت/منفی است.
+                sim = get_sim(node_embed, node_embed)
+                #subgraph-subgraph contrast loss (بدون تغییر)
                 subgraph_embed = F.normalize(subgraph_embed, dim=1, p=2)
                 subgraph_embed_hat = F.normalize(subgraph_embed_hat, dim=1, p=2)
                 sim_matrix_one = torch.matmul(subgraph_embed, subgraph_embed_hat.t())
@@ -178,7 +250,6 @@ if __name__ == '__main__':
                 NCE_loss = torch.mean(NCE_loss)
 
 
-
                 loss_all_1 = b_xent_context(logits_1, lbl_context)
                 loss_all_1_hat = b_xent_context(logits_1_hat, lbl_context)
                 loss_1 = torch.mean(loss_all_1)
@@ -193,6 +264,28 @@ if __name__ == '__main__':
                 loss_2 = args.alpha * loss_2 + (1 - args.alpha) * loss_2_hat #node-node contrast loss
                 loss = args.beta * loss_1 + (1 - args.beta) * loss_2 + 0.1 * NCE_loss #total loss
 
+                # محاسبه امتیاز ناهنجاری گره‌ای برای به‌روزرسانی ano_sim (منطق AD-GCL)
+                with torch.no_grad():
+                    test_logits_1 = torch.sigmoid(torch.squeeze(logits_1))
+                    test_logits_2 = torch.sigmoid(torch.squeeze(logits_2))
+                    test_logits_1_hat = torch.sigmoid(torch.squeeze(logits_1_hat))
+                    test_logits_2_hat = torch.sigmoid(torch.squeeze(logits_2_hat))
+
+                    # امتیاز ناهنجاری = منفی (امتیاز مثبت - میانگین امتیازات منفی)
+                    ano_score_1 = - (test_logits_1[:cur_batch_size] - torch.mean(test_logits_1[cur_batch_size:].view(cur_batch_size, args.negsamp_ratio_context), dim=1))
+                    ano_score_1_hat = - (test_logits_1_hat[:cur_batch_size] - torch.mean(test_logits_1_hat[cur_batch_size:].view(cur_batch_size, args.negsamp_ratio_context), dim=1))
+                    ano_score_2 = - (test_logits_2[:cur_batch_size] - torch.mean(test_logits_2[cur_batch_size:].view(cur_batch_size, args.negsamp_ratio_patch), dim=1))
+                    ano_score_2_hat = - (test_logits_2_hat[:cur_batch_size] - torch.mean(test_logits_2_hat[cur_batch_size:].view(cur_batch_size, args.negsamp_ratio_patch), dim=1))
+                    
+                    # ترکیب امتیازات
+                    ano_score_batch = args.beta * (args.alpha * ano_score_1 + (1 - args.alpha) * ano_score_1_hat)  + \
+                                      (1 - args.beta) * (args.alpha * ano_score_2 + (1 - args.alpha) * ano_score_2_hat)
+
+                # ذخیره امتیاز ناهنجاری گره‌ای در ماتریس موقت
+                current_loss_matrix[idx] = ano_score_batch.detach().cpu().numpy()
+                # ============================================================
+
+
                 loss.backward()
                 optimiser.step()
 
@@ -202,11 +295,20 @@ if __name__ == '__main__':
 
             mean_loss = (total_loss * batch_size + loss * cur_batch_size) / nb_nodes
 
+            # === E. ذخیره loss_matrix در انتهای Epoch ===
+            loss_matrix_list.append(current_loss_matrix.copy())
+            # ==========================================
+
+
             if mean_loss < best:
                 best = mean_loss
                 best_t = epoch
                 cnt_wait = 0
+                # ذخیره مدل و متغیرهای AD-GCL برای تست
                 torch.save(model.state_dict(), '{}.pkl'.format(args.dataset))
+                # ذخیره sim و ano_sim نهایی
+                torch.save(sim, '{}_sim.pt'.format(args.dataset))
+                torch.save(ano_sim, '{}_ano_sim.pt'.format(args.dataset))
             else:
                 cnt_wait += 1
 
@@ -219,6 +321,29 @@ if __name__ == '__main__':
         # Testing
         print('Loading {}th epoch'.format(best_t), flush=True)
         model.load_state_dict(torch.load('{}.pkl'.format(args.dataset)))
+        
+        # بارگذاری sim و ano_sim بهترین دوره برای تست
+        best_sim = torch.load('{}_sim.pt'.format(args.dataset)).to(device)
+        best_ano_sim = torch.load('{}_ano_sim.pt'.format(args.dataset)).to(device)
+
+        # === تولید نماهای نهایی برای Testing ===
+        # View 1: هرس (Pruning) - برای GRADATE (adj)
+        _, _, _, adj_view1_full_test = neighbor_pruning(
+            dgl_graph, node_dist.cpu(), best_sim.cpu(), features.cpu(), 
+            degree, args.feat_drop_rate_1, args.feat_drop_rate_1, args.degree_threshold
+        )
+        adj_view1_full_test = adj_view1_full_test.to(device)
+        
+        # View 2: تکمیل (Completion) - برای GRADATE (adj_hat)
+        _, _, _, _, adj_view2_full_test, _ = neighbor_completion(
+            dgl_graph, node_dist.cpu(), best_sim.cpu(), best_ano_sim.cpu(), features.cpu(), 
+            degree, args.feat_drop_rate_1, args.edge_mask_rate_1, 
+            args.feat_drop_rate_2, args.edge_mask_rate_2, args.degree_threshold, device
+        )
+        adj_view2_full_test = adj_view2_full_test.to(device)
+        # ========================================
+
+
         multi_round_ano_score = np.zeros((args.auc_test_rounds, nb_nodes))
         print('Testing AUC!', flush=True)
 
@@ -228,6 +353,7 @@ if __name__ == '__main__':
                 all_idx = list(range(nb_nodes))
                 random.shuffle(all_idx)
                 subgraphs = generate_rwr_subgraph(dgl_graph, subgraph_size)
+                
                 for batch_idx in range(batch_num):
                     optimiser.zero_grad()
                     is_final_batch = (batch_idx == (batch_num - 1))
@@ -236,17 +362,21 @@ if __name__ == '__main__':
                     else:
                         idx = all_idx[batch_idx * batch_size:]
                     cur_batch_size = len(idx)
+                    
                     ba = []
                     ba_hat = []
                     bf = []
+                    
                     added_adj_zero_row = torch.zeros((cur_batch_size, 1, subgraph_size)).to(device)
                     added_adj_zero_col = torch.zeros((cur_batch_size, subgraph_size + 1, 1)).to(device)
                     added_adj_zero_col[:, -1, :] = 1.
                     added_feat_zero_row = torch.zeros((cur_batch_size, 1, ft_size)).to(device)
+                    
                     for i in idx:
-                        cur_adj = adj[:, subgraphs[i], :][:, :, subgraphs[i]]
-                        cur_adj_hat = adj_hat[:, subgraphs[i], :][:, :, subgraphs[i]]
-                        cur_feat = features[:, subgraphs[i], :]
+                        # استفاده از نماهای نهایی تولید شده برای تست
+                        cur_adj = adj_view1_full_test[:, subgraphs[i], :][:, :, subgraphs[i]]
+                        cur_adj_hat = adj_view2_full_test[:, subgraphs[i], :][:, :, subgraphs[i]]
+                        cur_feat = features[np.newaxis, subgraphs[i], :]
                         ba.append(cur_adj)
                         ba_hat.append(cur_adj_hat)
                         bf.append(cur_feat)
@@ -259,6 +389,7 @@ if __name__ == '__main__':
                     ba_hat = torch.cat((ba_hat, added_adj_zero_col), dim=2)
                     bf = torch.cat(bf)
                     bf = torch.cat((bf[:, :-1, :], added_feat_zero_row, bf[:, -1:, :]), dim=1)
+
 
                     with torch.no_grad():
                         test_logits_1, test_logits_2, _, _ = model(bf, ba)
@@ -279,6 +410,7 @@ if __name__ == '__main__':
                         ano_score_2_hat = - (
                                     test_logits_2_hat[:cur_batch_size] - torch.mean(test_logits_2_hat[cur_batch_size:].view(
                                 cur_batch_size, args.negsamp_ratio_patch), dim=1)).cpu().numpy()
+                        
                         ano_score = args.beta * (args.alpha * ano_score_1 + (1 - args.alpha) * ano_score_1_hat)  + \
                                     (1 - args.beta) * (args.alpha * ano_score_2 + (1 - args.alpha) * ano_score_2_hat)
 
