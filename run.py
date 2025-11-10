@@ -1,6 +1,6 @@
 from model import Model
 from utils import *
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, roc_curve # <- تغییر: اضافه شدن roc_curve
 import random
 import os
 import dgl
@@ -8,6 +8,7 @@ import argparse
 import copy
 from tqdm import tqdm
 import torch.nn.functional as F
+import pickle # <- تغییر: اضافه شدن pickle برای ذخیره‌سازی داده‌ها
 
 # === ۱. ایمپورت توابع تقویت دینامیک از AD-GCL ===
 from aug import get_sim, neighbor_pruning, neighbor_completion 
@@ -25,14 +26,14 @@ os.environ['OMP_NUM_THREADS'] = '1'
 parser = argparse.ArgumentParser(description='GRADATE_ADGCL')
 parser.add_argument('--expid', type=int, default=1)
 parser.add_argument('--device', type=str, default='cuda:0')
-parser.add_argument('--dataset', type=str, default='cora')
+parser.add_argument('--dataset', type=str, default='pubmed')
 parser.add_argument('--lr', type=float, default=1e-3)
 parser.add_argument('--weight_decay', type=float, default=0.0)
-parser.add_argument('--runs', type=int, default=1)
+parser.add_argument('--runs', type=int, default=1) # <- تغییر: تنظیم روی 10 بار اجرا
 parser.add_argument('--embedding_dim', type=int, default=64)
 parser.add_argument('--patience', type=int, default=100)
 parser.add_argument('--num_epoch', type=int, default=400)
-parser.add_argument('--batch_size', type=int, default=300)
+parser.add_argument('--batch_size', type=int, default=64)
 parser.add_argument('--subgraph_size', type=int, default=4)
 parser.add_argument('--readout', type=str, default='avg')
 parser.add_argument('--auc_test_rounds', type=int, default=256)
@@ -59,6 +60,8 @@ if __name__ == '__main__':
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+    all_auc = [] # این لیست باید بیرون از حلقه runs باشد
+
     for run in range(args.runs):
 
         seed = run + 1
@@ -78,41 +81,25 @@ if __name__ == '__main__':
         ft_size = features.shape[1]
         nb_classes = labels.shape[1]
 
-        # === ۲. حذف منطق تقویت ساختار ثابت GRADATE اصلی ===
-        # adj_edge_modification = aug_random_edge(adj, 0.2)
-        # adj = normalize_adj(adj)
-        # adj = (adj + sp.eye(adj.shape[0])).todense()
-        # adj_hat = normalize_adj(adj_edge_modification)
-        # adj_hat = (adj_hat + sp.eye(adj_hat.shape[0])).todense()
-        # =======================================================
-        
-        # === ۳. مقداردهی اولیه متغیرهای دینامیک AD-GCL ===
+        # === مقداردهی اولیه متغیرهای دینامیک AD-GCL ===
         adj_numpy = adj.todense()
-        # degree: برای استفاده در pruning/completion
         degree = np.sum(adj_numpy, axis=1).flatten() 
-        # node_dist: نمایش مجاورت (یا ماتریس گره به گره)
         node_dist = torch.FloatTensor(adj_numpy).to(device)
-        
-        # loss_matrix_list: برای ذخیره زیان گره در طول W دوره
         loss_matrix = np.zeros(nb_nodes)
         loss_matrix_list = []
-        # ano_sim و sim: ماتریس‌های شباهت گره و ناهنجاری اولیه (همه یکسان)
-        # توجه: اینها در طول آموزش به صورت دینامیک به روز می‌شوند.
         ano_sim = torch.ones(nb_nodes, nb_nodes).to(device)
         sim = torch.ones(nb_nodes, nb_nodes).to(device)
         # =======================================================
 
-        # ویژگی‌ها را بدون بُعد اضافی به GPU می‌بریم (در داخل batch_idx به [np.newaxis] تبدیل می‌شود)
+        # ویژگی‌ها را بدون بُعد اضافی به GPU می‌بریم
         features = torch.FloatTensor(features).to(device) 
         labels = torch.FloatTensor(labels[np.newaxis]).to(device)
         idx_train = torch.LongTensor(idx_train).to(device)
         idx_val = torch.LongTensor(idx_val).to(device)
         idx_test = torch.LongTensor(idx_test).to(device)
 
-        all_auc = []
 
-
-        print('\n# Run:{} with random seed:{}'.format(run, seed), flush=True)
+        print('\n# Run:{} with random seed:{}'.format(run+1, seed), flush=True)
         dgl.random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)
@@ -149,16 +136,12 @@ if __name__ == '__main__':
                     ano_sim = torch.FloatTensor(ano_sim_cpu).to(device)
                     
             # === B. تولید نماهای ساختاری دینامیک A1 و A2 در هر Epoch ===
-            # View 1: هرس (Pruning) - برای GRADATE (adj)
-            # توجه: توابع AD-GCL ویژگی‌های ویژگی (feat1, feat2) را نیز دراپ می‌کنند اما در GRADATE فقط از adj استفاده می‌کنیم.
-            # ما فقط adj_view1_full را استخراج می‌کنیم.
             _, _, _, adj_view1_full = neighbor_pruning(
                 dgl_graph, node_dist.cpu(), sim.cpu(), features.cpu(), 
                 degree, args.feat_drop_rate_1, args.feat_drop_rate_1, args.degree_threshold
             )
             adj_view1_full = adj_view1_full.to(device)
             
-            # View 2: تکمیل (Completion) - برای GRADATE (adj_hat)
             _, _, _, _, adj_view2_full, _ = neighbor_completion(
                 dgl_graph, node_dist.cpu(), sim.cpu(), ano_sim.cpu(), features.cpu(), 
                 degree, args.feat_drop_rate_1, args.edge_mask_rate_1, 
@@ -203,11 +186,8 @@ if __name__ == '__main__':
 
                 for i in idx:
                     # === C. استخراج زیرگراف از نماهای دینامیک ===
-                    # نمای A1 (هرس)
                     cur_adj = adj_view1_full[:, subgraphs[i], :][:, :, subgraphs[i]] 
-                    # نمای A2 (تکمیل)
                     cur_adj_hat = adj_view2_full[:, subgraphs[i], :][:, :, subgraphs[i]]
-                    # ویژگی‌ها
                     cur_feat = features[np.newaxis, subgraphs[i], :]
                     
                     ba.append(cur_adj)
@@ -227,8 +207,6 @@ if __name__ == '__main__':
                 logits_1_hat, logits_2_hat,  subgraph_embed_hat, node_embed_hat = model(bf, ba_hat)
 
                 # === D. به‌روزرسانی sim و ذخیره امتیاز ناهنجاری ===
-                # محاسبه sim (شباهت گره‌ای) برای استفاده در دوره بعدی
-                # sim = get_sim(node_embed[:, -1, :], node_embed[:, -1, :]) # node_embed شامل گره‌های مثبت/منفی است.
                 sim = get_sim(node_embed, node_embed)
                 #subgraph-subgraph contrast loss (بدون تغییر)
                 subgraph_embed = F.normalize(subgraph_embed, dim=1, p=2)
@@ -418,13 +396,40 @@ if __name__ == '__main__':
 
                 pbar_test.update(1)
 
-            ano_score_final = np.mean(multi_round_ano_score, axis=0) + np.std(multi_round_ano_score, axis=0)
+            # === شروع بخش اصلاح شده نهایی (ذخیره ROC) ===
+            # 1. تصحیح محاسبه ano_score_final: فقط میانگین (بدون جمع با انحراف معیار)
+            ano_score_final = np.mean(multi_round_ano_score, axis=0) 
+            
+            # 2. محاسبه AUC و ذخیره‌سازی برای گزارش آماری
             auc = roc_auc_score(ano_label, ano_score_final)
             all_auc.append(auc)
-            print('Testing AUC:{:.4f}'.format(auc), flush=True)
+            
+            # 3. محاسبه FPR و TPR برای رسم نمودار ROC
+            fpr, tpr, _ = roc_curve(ano_label, ano_score_final)
+
+            # 4. ذخیره داده‌های ROC Curve در یک فایل pickle
+            MODEL_NAME = 'AD_GRADATE' 
+            output_file_name = f"roc_data_{MODEL_NAME}_run_{run+1}.pkl"
+            
+            results = {
+                'fpr': fpr.tolist(), 
+                'tpr': tpr.tolist(), 
+                'auc': auc,
+                'model_name': MODEL_NAME,
+                'dataset': args.dataset
+            }
+            
+            with open(output_file_name, 'wb') as f:
+                pickle.dump(results, f)
+            
+            print(f'Testing AUC for Run {run+1}: {auc:.4f}. ROC data saved to {output_file_name}', flush=True)
+            # === پایان بخش اصلاح شده نهایی ===
 
 
     print('\n==============================')
-    print(all_auc)
-    print('FINAL TESTING AUC:{:.4f}'.format(np.mean(all_auc)))
+    mean_auc_final = np.mean(all_auc)
+    std_auc_final = np.std(all_auc)
+    
+    print(f'All AUCs: {all_auc}')
+    print(f'FINAL AUC (Mean \u00B1 Std): {mean_auc_final:.4f} \u00B1 {std_auc_final:.4f}') # \u00B1 نماد ± است
     print('==============================')
